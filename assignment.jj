@@ -1,0 +1,837 @@
+PARSER_BEGIN(TPTP)
+
+import java.util.HashSet;
+import java.util.HashMap;
+
+/**
+ * Main parser class for TPTP programs.
+ * Handles parsing, semantic validation, execution setup and result output. 
+ */
+public class TPTP {
+
+  // ----- Static Fields: -----
+  static HashSet<String> stepNames = new HashSet<String>();   // Step names - used to detect F5 violations
+  static HashSet<String> stepRefs = new HashSet<String>();    // NSTEP/ESTEP names - used to detect F5 violations
+  static HashSet<String> paramNames = new HashSet<String>();  // Parameter names - used to detect F5 violations
+  static HashMap<String, StepData> steps = new HashMap<String, StepData>(); // Step names and information for evaluation
+
+  static String startStep;  // Stores the initial step name from the run instruction for execution
+  static long startX;       // Stores the initial value of parameter ID1 from the run instruction for execution
+  static long startY;       // Stores the initial value of parameter ID2 from the run instruction for execution
+
+  /**
+   * Entry point of the program.
+   * Reads input from System.in, parses it, and prints results to System.out or System.err (in the case of an error).
+   */
+  public static void main(String args [])   {
+   
+    TPTP parser = new TPTP(System.in);
+
+    try {
+      String[] result = parser.Start(); // Parse program and get result
+
+      System.out.println("Success");
+      System.out.println(result[0]);
+
+      if (result[1] != null) {
+        System.out.println(result[1]);
+      }
+
+    } catch (ParseException e) {
+      // ----- Syntax Errors -----
+
+      System.out.println("Failure");
+
+      if (e.currentToken != null) {
+        Token t = e.currentToken.next;   // Token that caused error
+        System.err.println(t.beginLine); // Line number of error
+
+        String expected = "";
+        if (e.expectedTokenSequences.length > 0) {
+          int kind = e.expectedTokenSequences[0][0];
+          expected = friendlyName(kind);
+        } 
+
+        System.err.println("Syntax Error: Unexpected token '" + t.image + "'" + ", expected " + expected);
+      } 
+
+    } catch (TPTPException e) {
+      // ----- Semantic Errors -----
+
+      System.out.println("Failure");
+      System.err.println(e.line);
+      System.err.println(e.msg);
+
+    } catch (TokenMgrError e) { 
+      // ----- Lexical Errors -----
+
+      System.out.println("Failure");
+
+      String errorMsg = e.getMessage(); // Error message with bad character
+
+      // Error line
+      int i = -1, j = -1;
+      int line = 0;
+
+      // Find line with bad character:
+      try {
+        i = errorMsg.indexOf("line ");
+        j = errorMsg.indexOf(",", i);
+
+        if (i != -1 || j != -1) {
+          line = Integer.parseInt(errorMsg.substring(i+5, j));
+        }
+      } catch (NumberFormatException ex) {
+          // Line stays 0
+      }
+
+      System.err.println(line); // Line with error
+
+      // Error message
+      String bad = "unknown";
+      int k = errorMsg.indexOf("Encountered: \""); // Find start index of bad character
+      if (k != -1) {
+        int start = k + 14;
+        int end = errorMsg.indexOf("\"", start); // Find end index of bad character
+        bad = errorMsg.substring(start, end); // Whole invalid string
+      }
+      System.err.println("Lexical error: invalid character '" + bad + "'");
+    } 
+   }   
+
+   /**
+    * Custom runtime exception class for semantic errors in TPTP programs,
+    * Includes line number and error message for reporting.
+    * Thrown manually during parsing when semantic conditions are violated, and caught in main to report failure.
+    */
+   static class TPTPException extends RuntimeException {
+    int line;
+    String msg;
+
+    /**
+     * Constructor for TPTPException.
+     * 
+     * @param line  Line number where the error occurred.
+     * @param msg   Descriptive error message explaining the semantic violation.
+     */
+    TPTPException(int line, String msg) {
+      this.line = line;
+      this.msg = msg;
+    }
+   }
+
+  /**
+   * Helper method to convert token kind to a friendly name for error messages.
+   * Takes a token kind (integer) and returns a human-readable string representing the expected token type, used in syntax error messages.
+   * 
+   * @param kind  The integer token kind to convert.
+   * @return      A string representing the expected token type for error messages.
+   */
+  private static String friendlyName(int kind) {
+    switch(kind) {
+      case TPTPConstants.IDENTIFIER: return "an identifier";
+      case TPTPConstants.NUMERAL: return "a numeral";
+      case TPTPConstants.RUN: return "'run'";
+      case TPTPConstants.IF: return "'if'";
+      case TPTPConstants.BECOMES: return "'becomes'";
+      case TPTPConstants.ELSE: return "'else'";
+      case TPTPConstants.AND: return "'and'";
+      case TPTPConstants.LPAREN: return "'(";
+      case TPTPConstants.RPAREN: return "')";
+      case TPTPConstants.COMMA: return "','";
+      case TPTPConstants.COLON: return "':'";
+      case TPTPConstants.SEMICOLON: return "';'";
+      case TPTPConstants.LTHAN: return "'<'";
+      case TPTPConstants.PLUS: return "'+'";
+      case TPTPConstants.MINUS: return "'-'";
+      case TPTPConstants.TIMES: return "'*'";
+      default: return TPTPConstants.tokenImage[kind];
+    }
+  }
+
+  /**
+   * Helper class to store information about an arithmetic expression.
+   * Used during parsing to determine if an expression is linear and/or a pure numeral, 
+   * as well as to store the expression for later evaluation during execution.
+   */
+  static class ExprInfo {
+    boolean isLinear;       
+    boolean isPureNumeral;  
+    Expr expr;              
+
+    /**
+     * Constructor for ExprInfo.
+     * 
+     * @param isLinear      True if the expression is linear, false otherwise.
+     * @param isPureNumeral True if the expression is a pure numeral, false otherwise (used for linearity checks in subtraction).
+     * @param expr          The expression itself, stored for later evaluation during execution.
+     */
+    ExprInfo(boolean isLinear, boolean isPureNumeral, Expr expr) {
+      this.isLinear = isLinear;
+      this.isPureNumeral = isPureNumeral;
+      this.expr = expr;
+    }
+  }
+
+  /**
+   * Helper class to store information about a step during parsing.
+   * Used to determine if a step is simple or non-simple based on the presence of non-linear expressions, 
+   * and to store the step name for reporting the first non-simple step if needed.
+   */
+  static class StepInfo {
+    boolean isSimple;
+    String stepName;
+
+    StepInfo(boolean isSimple, String stepName) {
+      this.isSimple = isSimple; // True if the step is simple, false otherwise
+      this.stepName = stepName;
+    }
+  }
+
+  /**
+   * Abstract class representing an arithmetic expression in the TPTP program.
+   * Subclasses represent specific types of expressions: Num for numerals, Var for variables (ID1 or ID2), and BinOp for binary operations (+, -, *).
+   */
+  static abstract class Expr {
+    /**
+     * Evaluates the expression given specific values for ID1 and ID2.
+     * 
+     * @param id1Val  Value of first parameter (ID1)
+     * @param id2Val  Value of second parameter (ID2)
+     * @return        The result of evaluating the expression
+     */
+    abstract long evaluate(long id1Val, long id2Val);
+  }
+
+  /**
+   * Class representing a numeric constant.
+   */
+  static class Num extends Expr {
+    long value;
+
+    /**
+     * Constructor for Num.
+     * 
+     * @param value The constant value.
+     */
+    Num(long value) {
+      this.value = value;
+    }
+
+    /**
+     * Evaluating a number simply returns its value.
+     */
+    long evaluate(long id1Val, long id2Val) { 
+      return value; 
+    }
+  }
+
+  /**
+   * Class representing a variable, which can be either ID1 or ID2.
+   */
+  static class Var extends Expr {
+    boolean isId1; // true = ID1, false = ID2
+
+    /**
+     * Constructor for Var.
+     * 
+     * @param isId1 True if this variable represents ID1, false if it represents ID2.
+     */
+    Var(boolean isId1) {
+      this.isId1 = isId1;
+    }
+
+    /**
+     * Returns the corresponding parameter value
+     */
+    long evaluate(long id1Val, long id2Val) {
+      return isId1? id1Val : id2Val;
+    }
+  }
+
+  /**
+   * Class representing a binary operation (addition, subtraction, multiplication) between two expressions.
+   */
+  static class BinOp extends Expr {
+    Expr left, right;
+    char op; // '+', '-', '*'
+
+    /**
+     * Constructor for BinOp.
+     * 
+     * @param left  The left-hand side expression.
+     * @param op    The operator, which can be '+', '-', or '*'.
+     * @param right The right-hand side expression.
+     */
+    BinOp(Expr left, char op, Expr right) {
+      this.left = left;
+      this.right = right;
+      this.op = op;
+    }
+
+    /**
+     * Evaluates the binary operation by first evaluating the left and right sub-expressions, then applying the operator to the results.
+     * 
+     * @param id1Val  Value of first parameter (ID1)
+     * @param id2Val  Value of second parameter (ID2)
+     * @return        The result of evaluating the binary operation
+     * @throws RuntimeException if the operator is unknown (fallback case, should not happen if parsing is correct)
+     */
+    long evaluate(long id1Val, long id2Val) {
+      long leftVal = left.evaluate(id1Val, id2Val);
+      long rightVal = right.evaluate(id1Val, id2Val);
+
+      switch (op) {
+        case '+': return leftVal + rightVal; 
+        case '-': return leftVal - rightVal; 
+        case '*': return leftVal * rightVal; 
+        default: throw new RuntimeException("Unknow operator: " + op);
+      }
+    }
+  }
+
+  /**
+   * Helper class to store all relevant information about a step for execution.
+   * Includes: step name, condition details, parameter names, expressions for both branches, and next step names for both branches.
+   * 
+   * Acts as a container for all data required to evaluate or simulate a step after parsing.
+   */
+  static class StepData {
+    String stepName;
+    boolean condIsId1;    // True if condition uses ID1, false if ID2
+    long condNum;         // The number in the condition
+    String id1Name;       // Name of ID1 parameter
+    String id2Name;       // Name of ID2 parameter
+    Expr e1, e2, e3, e4;  // Null if not present (in the case of short form)
+    String nstep;
+    String estep;
+
+    /**
+     * Constructor for StepData.
+     * 
+     * @param stepName  The name of the step.
+     * @param condIsId1 True if the condition uses ID1, false if it uses ID2.
+     * @param condNum   The numeric value used in the condition.
+     * @param id1Nam    The name of the ID1 parameter.
+     * @param id2Name   The name of the ID2 parameter.
+     * @param e1        First expression for the true branch (null if short form).
+     * @param e2        Second expression for the true branch (null if short form).
+     * @param e3        First expression for the false branch (null if short form).
+     * @param e4        Second expression for the false branch (null if short form).
+     * @param nstep     The name of the next step if the condition is true.
+     * @param estep     The name of the next step if the condition is false.
+     */
+    StepData(String stepName, boolean condIsId1, long condNum, String id1Name, String id2Name, Expr e1, Expr e2, Expr e3, Expr e4, String nstep, String estep) {
+      this.stepName = stepName;
+      this.condIsId1 = condIsId1;
+      this.condNum = condNum;
+      this.id1Name = id1Name;
+      this.id2Name = id2Name;
+      this.e1 = e1;
+      this.e2 = e2;
+      this.e3 = e3;
+      this.e4 = e4;
+      this.nstep = nstep;
+      this.estep = estep;
+    }
+  }
+
+  /**
+   * Helper method to check if an expression is non-negative for all possible values of ID1 and ID2 that satisfy the condition being false.
+   * Used to confirm condition S3 of simplicity, which requires that whenever parameters ID1 and ID2 assume non-negative values that make the condition false, the expressions E3 and E4 must also evaluate to non-negative values.
+   * 
+   * Based on:
+   * - The condition is of the form ID<NUM, so when the condition is false, ID>=NUM
+   * - The assumption that numeric literals and variables are non-negative
+   * - For simple expressions, the right-hand side of any subtraction must be a pure numeral, so we can determine the minimum value of the expression when the condition is false.
+   * - For addition and multiplication, both-sub expressions must be non-negative for the whole expression to be non-negative, which is given by the assumptions above.
+   * 
+   * @param e       The expression to analyse
+   * @param condVar The name of the variable used in the condition (ID1 or ID2)
+   * @param condNum The number used in the condition
+   * @param id1Name The name of the ID1 parameter
+   * @param id2Name The name of the ID2 parameter
+   * @return        True if the expression is non-negative for all values of ID1 and ID2 that make the condition false, false otherwise.
+   */
+  static boolean isNonNegative(Expr e, String condVar, long condNum, String id1Name, String id2Name) {
+    if (e instanceof Num) { return true; }  // A numeric literal is always treated as non-negative
+    if (e instanceof Var) { return true;}   // A variable is always treated as non-negative
+
+    if (e instanceof BinOp) {
+      BinOp b = (BinOp) e;
+
+      // Case: Subtraction - we need to check the right-hand side is a pure numeral and determine the minimum value of the expression when the condition is false
+      if (b.op == '-') {
+        long rightVal = ((Num) b.right).value;
+
+        // If the left-hand side is a numeral, we can directly check if the minimum value of the expression is non-negative when the condition is false
+        if (b.left instanceof Num) {
+          return ((Num) b.left).value >= rightVal;
+        }
+
+        // If the left-hand side is a variable, its minimum value is condNum, so we can check if condNum - rightVal is non-negative when the condition is false
+        if (b.left instanceof Var) {
+          Var v = (Var) b.left;
+          String varName = v.isId1? id1Name : id2Name;
+          if (varName.equals(condVar)) {
+            return condNum >= rightVal;
+          }
+          else {
+            return rightVal == 0;
+          }
+        }
+      }
+
+      // Case: Addition or Multiplication - evaluate left and right sub-expressions recursively
+      if (b.op == '+' || b.op == '*') {
+        return isNonNegative(b.left, condVar, condNum, id1Name, id2Name) && isNonNegative(b.right, condVar, condNum, id1Name, id2Name);
+      }
+    }
+    return true; // Fallback
+  }
+
+  /**
+   * Helper method to execute the TPTP program starting from the initial step and parameters specified in the run instruction.
+   * Simulates the execution of the program by evaluating steps according to the defined semantics, updating parameters, and tracking visited configurations to detect loops.
+   * 
+   * ----- Loop Detection -----
+   * A loop is detected by tracking visited configurations (step name + coordinates).
+   * If the same configuration is visited teice, the robot must be in an infinite loop.
+   * 
+   * Phase 1 (exact):   Store full configurations in "visited". If the same (step, x, y) is seen twice, a loop is detected.
+   * Phase 2 (Modular): After 100*N steps (where N is the number of steps in the program), switch to modular representation (step, x%10, y%10) to handle cases where coordinates grow very large.
+   *                    This works because in these cases, coordinate changes by at most 9 per step, so mod 10 cycles repeat.
+   *                    This ensures we can still detect loops without running out of memory by storing too many configurations.
+   * 
+   * @return A two-element String array:
+   *         - {"Loop", null} if an infinite loop is detected during execution
+   *         - {"Halt", "STEP X Y"} if execution halts, where STEP is the name of the step that does not exist, and X and Y are the final values of the parameters at halting.
+   */
+  static String[] execute() {
+    HashSet<String> visited = new HashSet<String>();    // Track visited configurations of (step, x, y) for loop detection
+    HashSet<String> visitedMod = new HashSet<String>(); // Track visited configurations in modular form (step, x%10, y%10) for loop detection when visited grows too large
+
+    String currentStep = startStep;
+    long x = startX;
+    long y = startY;
+
+    while (true) {
+      boolean useModular = visited.size() >= 100 * steps.size(); 
+
+      // If we have visited 100*number_of_steps configurations, switch to modular representation to save memory
+      if (useModular) {
+        String modConfig = currentStep + "(" + (x%10) + "," + (y%10) + ")";
+        // If the modular configuration has been visited, we assume a loop
+        if (visitedMod.contains(modConfig)) {
+          return new String[]{"Loop", null};
+        }
+        visitedMod.add(modConfig);
+      }
+      // Otherwise, use the full configuration for loop detection
+      else {
+        String config = currentStep + "(" + x + "," + y + ")";
+        String modConfig = currentStep + "(" + (x%10) + "," + (y%10) + ")"; // Also track the modular configuration to ensure we can switch to it later if needed
+        // If the same exact configuration has been visited, we have a loop
+        if (visited.contains(config)) {
+          return new String[]{"Loop", null};
+        }
+        visited.add(config);
+        visitedMod.add(modConfig);
+      }
+
+      // Look up current step data
+      StepData step = steps.get(currentStep);
+
+      // Evaluate condition and update coordinates
+      long condVal = step.condIsId1 ? x : y;
+
+      // If condition is true, update parameters using E1 and E2, and move to NSTEP
+      if (condVal < step.condNum) {
+        long newX = step.e1.evaluate(x, y);
+        long newY = step.e2.evaluate(x, y);
+
+        x = newX;
+        y = newY;
+
+        currentStep = step.nstep;
+      }
+
+      // If condition is false, update parameters using E3 and E4, and move to ESTEP
+      else {
+        long newX = step.e3.evaluate(x, y);
+        long newY = step.e4.evaluate(x, y);
+
+        x = newX;
+        y = newY;
+
+        currentStep = step.estep;
+      }
+
+      // Check if next step exists - if not, we halt and return the current step and parameter values
+      if (!steps.containsKey(currentStep)) {
+        return new String[]{"Halt", currentStep + " " + String.valueOf(x) + " " + String.valueOf(y)};
+      }
+    }
+  }
+}
+
+PARSER_END(TPTP)
+
+/**
+ * SKIP token to ignore whitespace characters (space, newline) during parsing.
+ */
+SKIP : {" " | "\n" }
+
+/**
+ * Token definitions for the TPTP language, including reserved keywords, operators, punctuation, numerals, and identifiers.
+ * The order of token definitions is important to ensure that reserved keywords are not misclassified as identifiers, and that the correct tokens are recognized during lexical analysis.
+ */
+TOKEN : {
+  < RUN: "run" >
+| < IF: "if" >
+| < BECOMES: "becomes" >
+| < ELSE: "else" >
+| < AND: "and" >
+| < LPAREN: "(" >
+| < RPAREN: ")" >
+| < COMMA: "," >
+| < COLON: ":" >
+| < SEMICOLON: ";" >
+| < LTHAN: "<" >
+| < PLUS: "+" >
+| < MINUS: "-" >
+| < TIMES: "*" >
+| < NUMERAL: (["0"-"9"])+ >
+| < IDENTIFIER: (["a"-"z", "A"-"Z"]) (["a"-"z", "A"-"Z", "0"-"9", "_"])*> // Last to ensure reserved keywords are not classed as identifiers
+}
+
+/**
+ * Grammar rules for the TPTP language, including the main entry point (Start), step instructions, run instruction, and arithmetic expressions.
+ * 
+ * Parses one or more step instructions followed by a run instruction and end of file.
+ * 
+ * Determines whether the program is Simple or Non-Simple:
+ * - If every step is simple, the program is Simple and we execute it to determine if it halts or loops.
+ * - If there is at least one non-simple step, the program is Non-Simple and we report the first non-simple step.
+ * 
+ * For simple programs, execution is simulated to determine whether the program halts or loops, and the appropriate result is returned.
+ * 
+ * @return A two-element String array:
+ *         - If the program is Simple:      {"Simple", "Loop"} if it loops,
+ *                                          {"Simple", "Halt STEP X Y"} if it halts, where STEP is the name of the step that does not exist, and X and Y are the final values of the parameters at halting.
+ *         - If the program is Non-Simple:  {"Non-simple", "STEP"}, where STEP is the name of the first non-simple step.
+ */
+String[] Start(): { StepInfo info; String firstNonSimple = null; String[] result = new String[2]; }
+{
+  ( 
+    info = stepInstruction()
+    {
+      // Record the first non-simple step if we haven't already
+      if (!info.isSimple && firstNonSimple == null) {
+        firstNonSimple = info.stepName;
+      }
+    }
+  )+ 
+
+  runInstruction()
+  <EOF>
+
+  {
+    // If there are no non-simple steps, execute the program to determine if it halts or loops
+    if (firstNonSimple == null) {
+      result[0] = "Simple";
+      String[] execResult = execute();
+      if (execResult[0].equals("Loop")) {
+        result[1] = "Loop";
+      }
+      else {
+        result[1] = execResult[1];
+      }
+    }
+
+    // Otherwise, report the first non-simple step
+    else {
+      result[0] = "Non-simple";
+      result[1] = firstNonSimple;
+    }
+  }
+
+  { return result; }
+}
+
+/**
+ * Parses the run instruction, which specifies the initial step and parameter values for executing the TPTP program.
+ * Performs semantic validation to ensure that the step mentioned in the run instruction exists in the program (Further Condition 10).
+ * Stores the initial step name and parameter values in static fields for use during execution.
+ * 
+ * @throws TPTPException if the step mentioned in the run instruction does not exist in the program, with an appropriate error message and line number.
+ */
+void runInstruction(): { Token stepName; Token num1; Token num2; }
+{
+  <RUN> 
+
+  stepName = <IDENTIFIER>  // STEP
+  {
+    // Further Condition 10: the step mentioned in the run instruction must be present in the program.
+    if (!stepNames.contains(stepName.image)) {
+      throw new TPTPException(stepName.beginLine, "The step '" + stepName.image + "' does not exist." );
+    }
+  }
+
+  <LPAREN> 
+  num1 = <NUMERAL>     // NUM1
+  <COMMA> 
+  num2 = <NUMERAL>     // NUM2
+  <RPAREN> 
+
+  {
+    // Store initial step and parameter values for execution
+    startStep = stepName.image;
+    startX = Long.parseLong(num1.image);
+    startY = Long.parseLong(num2.image);
+  }
+}
+
+/**
+ * Parses a single step instruction and performs semantic validation.
+ * Checks Further Conditions 5, 6, and 8, and validates the COND identifier.
+ * Determines whether the step is simple by checking positive linearity of expressions, absence of subtraction in E1/E2, and nonnegativity of E3/E4 when COND is false.
+ * Builds a StepData object and stores it for later execution.
+ * 
+ * @return StepInfo containing whether the step is simple and its name
+ * @throws TPTPException if any semantic conditions are violated, with an appropriate error message and line number.
+ */
+StepInfo stepInstruction(): { 
+  Token stepName; Token id1; Token id2; Token condID; 
+  Token nstep; Token estep;
+  Token condnum;
+  ExprInfo e1 = null; ExprInfo e2 = null; ExprInfo e3 = null; ExprInfo e4 = null;
+  boolean isSimple = true; 
+  boolean condIsId1 = false;
+}
+{
+  stepName = <IDENTIFIER>  // STEP
+  {
+    // Further Condition 8: no reuse of step names
+    if (stepNames.contains(stepName.image)) {
+      throw new TPTPException(stepName.beginLine, "Step with name '" + stepName.image + "' already exists.");
+    }
+
+    // Further Condition 5: a parameter name cannot be used as a step name 
+    if (paramNames.contains(stepName.image)) {
+      throw new TPTPException(stepName.beginLine, "'" + stepName.image + "' already exists as a parameter name in the program.");
+    }
+    stepNames.add(stepName.image);
+  }
+  <COLON>
+  <IF>
+
+  // COND:
+  condID = <IDENTIFIER>  // ID1 or ID2
+  <LTHAN>
+  condnum = <NUMERAL>
+  
+  <LPAREN>
+  id1 = <IDENTIFIER>  // ID1
+  {
+    // Further Condition 5: a step name cannot be used as a parameter name
+    if (stepNames.contains(id1.image)) {
+      throw new TPTPException(id1.beginLine, "'" + id1.image + "' is already used as a step name in the program.");
+    }
+    // Further Condition 5: a step reference name cannot be used as a parameter name
+    if (stepRefs.contains(id1.image)) {
+      throw new TPTPException(id1.beginLine, "'" + id1.image + "' is already used as a step reference in the program.");
+    }
+    paramNames.add(id1.image);
+  }
+  <COMMA>       
+  id2 = <IDENTIFIER>  // ID2
+  {
+    // Further Condition 5: a step name cannot be used as a parameter name
+    if (stepNames.contains(id2.image)) {
+      throw new TPTPException(id2.beginLine, "'" + id2.image + "' is already used as a step name in the program.");
+    }
+    // Further Condition 5: a step reference name cannot be used as a parameter name
+    if (stepRefs.contains(id2.image)) {
+      throw new TPTPException(id2.beginLine, "'" + id2.image + "' is already used as a step reference in the program.");
+    }
+    paramNames.add(id2.image);
+  }
+  <RPAREN>
+
+  {
+    // Further Condition 6: ID1 and ID2 cannot be the same
+    if (id1.image.equals(id2.image)) {
+      throw new TPTPException(id1.beginLine, "Identifiers ID1 and ID2 must be different.");
+    }
+
+    // Step Instruction Condition - COND is of the form ID<NUM where ID = ID1/ID2
+    if (!condID.image.equals(id1.image) && !condID.image.equals(id2.image)) {
+      throw new TPTPException(condID.beginLine, "ID is not equal to either ID1 or ID2.");
+    }
+
+    condIsId1 = condID.image.equals(id1.image); // True if condition uses ID1, false if ID2
+  }
+
+  // Optional for Short Form:
+  [<BECOMES>
+  <LPAREN>
+  e1 = expr(false, id1.image, id2.image)        // E1
+  { 
+    // Simplicity check S1 (positive linear) and S2 (no subtraction) for E1
+    // allowSubtraction=false ensures subtraction marks this step as non-simple
+    if (!e1.isLinear) { isSimple = false; }
+  }
+  <COMMA>
+  e2 = expr(false, id1.image, id2.image)        // E2
+  { 
+    // Simplicity check S1 (positive linear) and S2 (no subtraction) for E2
+    // allowSubtraction=false ensures subtraction marks this step as non-simple
+    if (!e2.isLinear) { isSimple = false; }
+  }
+  <RPAREN>
+  <AND>] 
+
+  nstep = <IDENTIFIER>  // NSTEP
+  {
+    // Further Condition 5: no reuse of parameter names for step reference names
+    if (paramNames.contains(nstep.image)) {
+      throw new TPTPException(nstep.beginLine, "'" + nstep.image + "' is already used as a parameter name.");
+    }
+    stepRefs.add(nstep.image);
+  }
+
+  <ELSE>  
+
+  // Optional for Short Form:
+  [<LPAREN>
+  e3 = expr(true, id1.image, id2.image)        // E3
+  { 
+    // Simplicity check S1 (positive linear) for E3
+    if (!e3.isLinear) { isSimple = false; }
+    // Check for non-negativity of E3 when condition is false
+    if (!isNonNegative(e3.expr, condID.image, Long.parseLong(condnum.image), id1.image, id2.image)) { isSimple = false; }
+  }
+  <COMMA>
+  e4 = expr(true, id1.image, id2.image)        // E4
+  { 
+    // Simplicity check S1 (positive linear) for E4
+    if (!e4.isLinear) { isSimple = false; }
+    // Check for non-negativity of E4 when condition is false
+    if (!isNonNegative(e4.expr, condID.image, Long.parseLong(condnum.image), id1.image, id2.image)) { isSimple = false; }
+  }
+  <RPAREN>
+  <AND>] 
+
+  estep =<IDENTIFIER>  // ESTEP
+  {
+    // Further Condition 5: no reuse of parameter names for step reference names
+    if (paramNames.contains(estep.image)) {
+        throw new TPTPException(estep.beginLine, "'" + estep.image + "' is already used as a parameter name.");
+      }
+      stepRefs.add(estep.image);
+  }
+  <SEMICOLON>
+
+  
+  {
+    // Build and store step data:
+
+    // Handle short form - null expressions default to ID1/ID2
+    Expr expr1 = (e1 != null) ? e1.expr : new Var(true); // Default to ID1
+    Expr expr2 = (e2 != null) ? e2.expr : new Var(false); // Default to ID2
+    Expr expr3 = (e3 != null) ? e3.expr : new Var(true); // Default to ID1
+    Expr expr4 = (e4 != null) ? e4.expr : new Var(false); // Default to ID2
+
+    StepData step = new StepData(
+      stepName.image, condIsId1, Long.parseLong(condnum.image),
+      id1.image, id2.image,
+      expr1, expr2, expr3, expr4,
+      nstep.image, estep.image
+    );
+    steps.put(stepName.image, step);
+
+    return new StepInfo(isSimple, stepName.image);
+  }
+}
+
+/**
+ * Parses an arithmetic expression following the grammar term ((+|-) term)*.
+ * Checks for linearity and the presence of subtraction where not allowed.
+ * 
+ * @param allowSubtraction  True if subtraction is allowed in this expression (false for E1/E2, true for E3/E4)
+ * @param id1Name           The name of the ID1 parameter, used for linearity checks
+ * @param id2Name           The name of the ID2 parameter, used for linearity checks
+ * @return                  An ExprInfo object containing the expression tree and linearity info
+ * @throws TPTPException if subtraction is used in E1/E2, or if linearity conditions are violated, with an appropriate error message and line number.
+ */
+ExprInfo expr(boolean allowSubtraction, String id1Name, String id2Name): { ExprInfo t; Token operation = null; ExprInfo exprInfo; }
+{
+  t = term(allowSubtraction, id1Name, id2Name) 
+  { exprInfo = t; }
+  (
+    { operation = null; } // Reset operation at the start of each iteration
+    (<PLUS> | operation = <MINUS>) 
+    t = term(allowSubtraction, id1Name, id2Name)
+    { 
+      char op = (operation != null) ? '-' : '+';
+      boolean linear = exprInfo.isLinear && t.isLinear;
+
+      // Additional linearity checks for minus
+      if (operation != null) {
+        if (!allowSubtraction) linear = false;
+        if (!t.isPureNumeral) linear = false; 
+      }
+
+      exprInfo = new ExprInfo(linear, false, new BinOp(exprInfo.expr, op, t.expr));
+
+    }
+  )*
+  { return exprInfo; }
+}
+
+/**
+ * Parses an arithmetic expression following the grammar factor ("*" factor)*.
+ * Checks for linearity and the presence of subtraction where not allowed.
+ * 
+ * @param allowSubtraction  True if subtraction is allowed in this expression (false for E1/E2, true for E3/E4)
+ * @param id1Name           The name of the ID1 parameter, used for linearity checks
+ * @param id2Name           The name of the ID2 parameter, used for linearity checks
+ * @return                  An ExprInfo object containing the expression tree and linearity info
+ */
+ExprInfo term(boolean allowSubtraction, String id1Name, String id2Name): { ExprInfo exprInfo; ExprInfo f; }
+{
+  f = factor(allowSubtraction, id1Name, id2Name) 
+    { exprInfo = f; } // A factor is linear if it is linear
+  (
+    <TIMES> f = factor(allowSubtraction, id1Name, id2Name) 
+    { exprInfo = new ExprInfo(false, false, new BinOp(exprInfo.expr, '*', f.expr)); } // Multiplication always results in a non-linear expression
+  )*
+
+  { return exprInfo; }
+}
+
+/**
+ * Parses an arithmetic expression following the grammar factor NUMERAL | IDENTIFIER | LPAREN expr RPAREN.
+ * Checks for linearity and the presence of subtraction where not allowed.
+ * - A NUMERAL is treated as a pure numeral, which is used for linearity checks in subtraction.
+ * - An IDENTIFIER is treated as a variable (ID1 or ID2), which is linear but not a pure numeral.
+ * - Parenthesized expressions are evaluated recursively, and their linearity is determined by their contents.
+ * 
+ * @param allowSubtraction  True if subtraction is allowed in this expression (false for E1/E2, true for E3/E4)
+ * @param id1Name           The name of the ID1 parameter, used for linearity checks
+ * @param id2Name           The name of the ID2 parameter, used for linearity checks
+ * @return                  An ExprInfo object containing the expression tree and linearity info
+ */
+ExprInfo factor(boolean allowSubtraction, String id1Name, String id2Name): { ExprInfo innerInfo; Token t; }
+{
+  t = <NUMERAL> { return new ExprInfo(true, true, new Num(Long.parseLong(t.image))); } // A numeral is linear and a pure numeral
+
+| t = <IDENTIFIER> { 
+    boolean isId1 = t.image.equals(id1Name);
+    return new ExprInfo(true, false, new Var(isId1));  // An identifier is linear but not a pure numeral
+  }
+
+| <LPAREN> innerInfo = expr(allowSubtraction, id1Name, id2Name) <RPAREN> 
+  { return new ExprInfo(innerInfo.isLinear, false, innerInfo.expr); } // Parenthesized expressions are linear if their contents are linear, but they are not pure numerals even if their contents are.
+}
